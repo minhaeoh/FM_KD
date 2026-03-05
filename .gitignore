@@ -1,0 +1,14 @@
+# Ignore the checkpoints directory where model checkpoints are saved during training
+checkpoints/
+
+# Dataset
+data/
+
+# slurm output files
+*.out
+
+# python cache files
+__pycache__/
+
+# env files
+*.env
