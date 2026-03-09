@@ -1,11 +1,16 @@
 # Ignore the checkpoints directory where model checkpoints are saved during training
 checkpoints/
+checkpoints_cfd_fsdp/
 
 # Dataset
 data/
 
+logs/
+wandb/
+
 # slurm output files
 *.out
+*.log
 
 # python cache files
 __pycache__/

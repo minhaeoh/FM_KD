@@ -2,6 +2,7 @@ import os
 import math
 import time
 import random
+import json
 from typing import Dict, Any, Optional, Tuple
 
 import torch
@@ -27,6 +28,69 @@ def set_seed(seed: int) -> None:
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
+
+class AdaptiveLossWeightBalancer:
+    """
+    Auto-tune lambdas so weighted losses are on similar scales.
+    """
+
+    def __init__(self, cfg: TrainConfig):
+        self.cfg = cfg
+        self.decay = float(cfg.balance_ema_decay)
+        self.update_every = int(cfg.balance_update_every)
+        self.warmup_steps = int(cfg.balance_warmup_steps)
+        self.loss_eps = float(cfg.balance_loss_eps)
+        self.min_lambda = float(cfg.balance_min_lambda)
+        self.max_lambda = float(cfg.balance_max_lambda)
+        self.keys = ("fm", "anchor", "ce", "kl")
+        self.init_lambdas = {k: float(getattr(cfg, f"lambda_{k}")) for k in self.keys}
+        self.active = [k for k in self.keys if self.init_lambdas[k] > 0.0]
+        self.ema: Dict[str, float] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.cfg.auto_balance_losses) and len(self.active) > 0
+
+    def weighted(self, raw: Dict[str, float]) -> Dict[str, float]:
+        return {k: float(getattr(self.cfg, f"lambda_{k}")) * float(raw[k]) for k in self.keys}
+
+    def update(self, step: int, raw: Dict[str, float]) -> None:
+        if not self.enabled:
+            return
+
+        present: list[str] = []
+        for k in self.active:
+            cur = float(raw[k])
+            if (not math.isfinite(cur)) or cur <= self.loss_eps:
+                continue
+            present.append(k)
+            if k not in self.ema:
+                self.ema[k] = cur
+            else:
+                self.ema[k] = self.decay * self.ema[k] + (1.0 - self.decay) * cur
+
+        # Avoid balancing from sparse/absent objectives (e.g., CE/KL often zero).
+        if len(present) < 2:
+            return
+
+        if step < self.warmup_steps or (step % self.update_every) != 0:
+            return
+
+        eligible = [k for k in present if k in self.ema and self.ema[k] > self.loss_eps]
+        if len(eligible) < 2:
+            return
+
+        inv_sum = sum(1.0 / max(self.ema[k], 1e-12) for k in eligible)
+        if inv_sum <= 0.0:
+            return
+
+        init_sum = sum(self.init_lambdas[k] for k in eligible)
+        target_weighted = init_sum / inv_sum
+        for k in eligible:
+            lam = target_weighted / max(self.ema[k], 1e-12)
+            lam = min(max(lam, self.min_lambda), self.max_lambda)
+            setattr(self.cfg, f"lambda_{k}", float(lam))
+
 def save_checkpoint(
     cfg: TrainConfig,
     step: int,
@@ -34,7 +98,8 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scaler: Optional[torch.cuda.amp.GradScaler] = None,
 ) -> None:
-    ensure_dir(cfg.output_dir)
+    ckpt_dir = os.path.join(cfg.output_dir, cfg.run_name, f"step_{step:07d}")
+    ensure_dir(ckpt_dir)
     ckpt = {
         "step": step,
         "model": model.state_dict(),
@@ -43,8 +108,11 @@ def save_checkpoint(
     }
     if scaler is not None:
         ckpt["scaler"] = scaler.state_dict()
-    path = os.path.join(cfg.output_dir, f"{cfg.run_name}_step{step}.pt")
+    path = os.path.join(ckpt_dir, "checkpoint.pt")
+    cfg_path = os.path.join(ckpt_dir, "config.json")
     torch.save(ckpt, path)
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(cfg.__dict__, f, ensure_ascii=False, indent=2)
     print(f"[ckpt] saved: {path}")
 
 
@@ -69,9 +137,16 @@ def _extract_student_state_dict(obj: Any) -> Dict[str, torch.Tensor]:
                 "Expected raw state_dict or one of keys: model/student/state_dict."
             )
 
-    # Handle DataParallel/DDP prefix if present.
+    # Normalize wrapper prefixes from DDP/FSDP containers.
     if state and all(k.startswith("module.") for k in state.keys()):
         state = {k[len("module.") :]: v for k, v in state.items()}
+
+    # FSDP checkpoints can store train-module state (e.g., student.* + mask_init.*).
+    # Keep only student params when present and strip the wrapper prefix.
+    if state:
+        student_state = {k[len("student.") :]: v for k, v in state.items() if k.startswith("student.")}
+        if student_state:
+            state = student_state
     return state
 
 
@@ -100,7 +175,8 @@ batch = {
   # e.g. 12 anchors from teacher layers -> (B, M, y_len, D)
   "teacher_anchors": FloatTensor [B, M, y_len, D]
 
-  # teacher X hidden states for all sampled layers (M+1 endpoints)
+  # optional teacher X hidden states for all sampled layers (M+1 endpoints)
+  # (not used in x_ids-only training mode)
   "teacher_x_layers": FloatTensor [B, M+1, x_len, D]
 
   # fixed-length full-sequence placeholders + mask
@@ -109,6 +185,9 @@ batch = {
 
   # optional: teacher logits for Y positions (if cached)
   # "teacher_logits": FloatTensor [B, y_len, vocab]
+  # or top-k compressed teacher logits:
+  # "teacher_logits_topk_vals": FloatTensor [B, y_len, topk]
+  # "teacher_logits_topk_idx":  IntTensor   [B, y_len, topk]
 
   # optional: non-uniform times (length M+1)
   # "times": FloatTensor [M+1]  (global for batch)
@@ -135,6 +214,12 @@ def sample_interval_and_time(
     M = cfg.num_intervals
     # interval index
     k = torch.randint(low=0, high=M, size=(batch_size,), device=device)
+    p_last = float(getattr(cfg, "last_interval_sample_prob", 0.0))
+    if p_last > 0.0:
+        p_last = max(0.0, min(1.0, p_last))
+        choose_last = torch.rand(batch_size, device=device) < p_last
+        if choose_last.any():
+            k = torch.where(choose_last, torch.full_like(k, M - 1), k)
 
     # local coordinate s in [0,1]
     s = torch.rand(batch_size, device=device)
@@ -146,7 +231,7 @@ def sample_interval_and_time(
 
 
 # ============================================================
-# Main training step skeleton
+# Main training step
 # ============================================================
 
 class MaskInit(nn.Module):
@@ -166,7 +251,7 @@ class MaskInit(nn.Module):
         return self.mask.view(1, 1, -1).to(device).expand(batch_size, y_len, -1)
 
 
-def compute_losses_skeleton(
+def compute_losses(
     cfg: TrainConfig,
     student: nn.Module,
     mask_init: MaskInit,
@@ -187,14 +272,11 @@ def compute_losses_skeleton(
 
     y_mask = batch["y_mask"].to(device)  # [B, y_len] (0/1)
 
+    x_ids = batch["x_ids"].to(device=device, dtype=torch.long)
     teacher_anchors = batch["teacher_anchors"].to(device)  # [B, M, y_len, D]
-    teacher_x_layers = batch["teacher_x_layers"].to(device)  # [B, M+1, x_len, D]
     B, M, y_len, D = teacher_anchors.shape
-    _, M_x, x_len, D_x = teacher_x_layers.shape
 
     assert M == cfg.num_intervals, f"Expected {cfg.num_intervals} anchors, got {M}"
-    assert M_x == (M + 1), f"Expected teacher_x_layers dim1={M+1}, got {M_x}"
-    assert D_x == D, f"X/Y hidden dim mismatch: D_x={D_x}, D_y={D}"
 
     # times: [M+1]
     if "times" in batch:
@@ -256,23 +338,25 @@ def compute_losses_skeleton(
     # z_t = z_t + sigma(t) * torch.randn_like(z_t)
 
     # ------------------------------------------------------------
-    # Construct X_t from the sampled interval left endpoint.
-    # Interval k corresponds to teacher layer transition L_k -> L_{k+1}.
-    # We set x_t = x0 = hidden(L_k) (not a single global x_0).
-    # ------------------------------------------------------------
-    x_idx = k.view(B, 1, 1, 1).expand(-1, 1, x_len, D)
-    x_t = torch.gather(teacher_x_layers, dim=1, index=x_idx).squeeze(1)  # [B, x_len, D]
-
-    # ------------------------------------------------------------
     # Student predicts velocity v_theta(z_t, t, X)
+    # Keep activations aligned with student param dtype (e.g., bf16 FSDP).
+    # X conditioning uses token embeddings only (x_ids), matching inference.
     # ------------------------------------------------------------
+    student_dtype = None
+    for p in student.parameters():
+        if p.is_floating_point():
+            student_dtype = p.dtype
+            break
+    if student_dtype is not None:
+        z_t = z_t.to(dtype=student_dtype)
+
     v = student(
         z_y=z_t,
         t=t,              # [B]
-        x_ids=None,
+        x_ids=x_ids,
         x_mask=x_mask,
         y_mask=y_mask,
-        x_states=x_t,
+        x_states=None,
     )  # [B, y_len, D]
 
     # ------------------------------------------------------------
@@ -337,32 +421,74 @@ def compute_losses_skeleton(
                 )
 
         if use_kl:
-            if "teacher_logits" not in batch:
-                raise KeyError("Batch must include `teacher_logits` when lambda_kl is non-zero.")
-            teacher_logits = batch["teacher_logits"].to(device=device, dtype=torch.float32)
-            if teacher_logits.ndim != 3:
-                raise ValueError(
-                    f"teacher_logits must have shape [B, y_len, vocab], got {tuple(teacher_logits.shape)}."
-                )
-            if teacher_logits.size(0) != B or teacher_logits.size(1) != y_len:
-                raise ValueError(
-                    "teacher_logits shape mismatch: "
-                    f"expected first dims {(B, y_len)}, got {tuple(teacher_logits.shape[:2])}."
-                )
-
-            teacher_logits_last = teacher_logits[is_last]
-            if teacher_logits_last.size(-1) != student_logits.size(-1):
-                raise ValueError(
-                    "Vocab mismatch between teacher and student logits: "
-                    f"{teacher_logits_last.size(-1)} vs {student_logits.size(-1)}."
-                )
-
             valid_tokens = y_valid[is_last]
             if valid_tokens.any():
-                student_log_probs = F.log_softmax(student_logits, dim=-1)
-                teacher_probs = F.softmax(teacher_logits_last, dim=-1)
-                token_kl = F.kl_div(student_log_probs, teacher_probs, reduction="none").sum(dim=-1)
-                loss_kl = token_kl.masked_select(valid_tokens).mean()
+                if "teacher_logits" in batch:
+                    teacher_logits = batch["teacher_logits"].to(device=device, dtype=torch.float32)
+                    if teacher_logits.ndim != 3:
+                        raise ValueError(
+                            f"teacher_logits must have shape [B, y_len, vocab], got {tuple(teacher_logits.shape)}."
+                        )
+                    if teacher_logits.size(0) != B or teacher_logits.size(1) != y_len:
+                        raise ValueError(
+                            "teacher_logits shape mismatch: "
+                            f"expected first dims {(B, y_len)}, got {tuple(teacher_logits.shape[:2])}."
+                        )
+
+                    teacher_logits_last = teacher_logits[is_last]
+                    if teacher_logits_last.size(-1) != student_logits.size(-1):
+                        raise ValueError(
+                            "Vocab mismatch between teacher and student logits: "
+                            f"{teacher_logits_last.size(-1)} vs {student_logits.size(-1)}."
+                        )
+
+                    student_log_probs = F.log_softmax(student_logits, dim=-1)
+                    teacher_probs = F.softmax(teacher_logits_last, dim=-1)
+                    token_kl = F.kl_div(student_log_probs, teacher_probs, reduction="none").sum(dim=-1)
+                    loss_kl = token_kl.masked_select(valid_tokens).mean()
+                elif "teacher_logits_topk_vals" in batch and "teacher_logits_topk_idx" in batch:
+                    teacher_topk_vals = batch["teacher_logits_topk_vals"].to(device=device, dtype=torch.float32)
+                    teacher_topk_idx = batch["teacher_logits_topk_idx"].to(device=device, dtype=torch.long)
+                    if teacher_topk_vals.ndim != 3 or teacher_topk_idx.ndim != 3:
+                        raise ValueError(
+                            "teacher_logits_topk tensors must have shape [B, y_len, topk], got "
+                            f"{tuple(teacher_topk_vals.shape)} and {tuple(teacher_topk_idx.shape)}."
+                        )
+                    if teacher_topk_vals.shape != teacher_topk_idx.shape:
+                        raise ValueError(
+                            "teacher_logits_topk vals/idx shape mismatch: "
+                            f"{tuple(teacher_topk_vals.shape)} vs {tuple(teacher_topk_idx.shape)}."
+                        )
+                    if teacher_topk_vals.size(0) != B or teacher_topk_vals.size(1) != y_len:
+                        raise ValueError(
+                            "teacher_logits_topk shape mismatch: "
+                            f"expected first dims {(B, y_len)}, got {tuple(teacher_topk_vals.shape[:2])}."
+                        )
+                    if teacher_topk_idx.numel() > 0:
+                        min_idx = int(teacher_topk_idx.min().item())
+                        max_idx = int(teacher_topk_idx.max().item())
+                        vocab_size = student_logits.size(-1)
+                        if min_idx < 0 or max_idx >= vocab_size:
+                            raise ValueError(
+                                "teacher_logits_topk_idx out of vocab range: "
+                                f"min={min_idx}, max={max_idx}, vocab={vocab_size}."
+                            )
+
+                    teacher_topk_vals_last = teacher_topk_vals[is_last]
+                    teacher_topk_idx_last = teacher_topk_idx[is_last]
+                    student_topk_logits = torch.gather(student_logits, dim=-1, index=teacher_topk_idx_last)
+
+                    # KL on teacher top-k support (conditional distributions on selected support).
+                    teacher_topk_probs = F.softmax(teacher_topk_vals_last, dim=-1)
+                    student_topk_log_probs = F.log_softmax(student_topk_logits, dim=-1)
+                    token_kl = F.kl_div(student_topk_log_probs, teacher_topk_probs, reduction="none").sum(dim=-1)
+                    loss_kl = token_kl.masked_select(valid_tokens).mean()
+                else:
+                    raise KeyError(
+                        "Batch must include either `teacher_logits` or "
+                        "(`teacher_logits_topk_vals`, `teacher_logits_topk_idx`) "
+                        "when lambda_kl is non-zero."
+                    )
 
     # ------------------------------------------------------------
     # Total
@@ -391,7 +517,10 @@ def compute_losses_skeleton(
 
 def train_main(cfg: TrainConfig) -> None:
     set_seed(cfg.seed)
+    run_timestamp = time.strftime("%Y%m%d_%H%M")
+    cfg.output_dir = os.path.join(cfg.output_dir, run_timestamp)
     ensure_dir(cfg.output_dir)
+    print(f"[run] output_root={cfg.output_dir}")
 
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
 
@@ -474,6 +603,7 @@ def train_main(cfg: TrainConfig) -> None:
     )
 
     scaler = torch.cuda.amp.GradScaler(enabled=(cfg.amp and device.type == "cuda"))
+    loss_balancer = AdaptiveLossWeightBalancer(cfg)
 
     if getattr(cfg, "detect_anomaly", False):
         torch.autograd.set_detect_anomaly(True)
@@ -493,7 +623,7 @@ def train_main(cfg: TrainConfig) -> None:
         step += 1
 
         with torch.cuda.amp.autocast(enabled=(cfg.amp and device.type == "cuda")):
-            losses = compute_losses_skeleton(cfg, student, mask_init, batch)
+            losses = compute_losses(cfg, student, mask_init, batch)
             loss = losses["loss_total"] / cfg.grad_accum_steps
 
         scaler.scale(loss).backward()
@@ -512,6 +642,13 @@ def train_main(cfg: TrainConfig) -> None:
         if step % cfg.log_every == 0:
             elapsed = time.time() - t_start
             it_s = step / max(elapsed, 1e-6)
+            raw = {
+                "fm": float(losses["loss_fm"].item()),
+                "anchor": float(losses["loss_anchor"].item()),
+                "ce": float(losses["loss_ce"].item()),
+                "kl": float(losses["loss_kl"].item()),
+            }
+            weighted = loss_balancer.weighted(raw)
             msg = (
                 f"[step {step:>6}] "
                 f"loss={losses['loss_total'].item():.4f} "
@@ -519,6 +656,14 @@ def train_main(cfg: TrainConfig) -> None:
                 f"anc={losses['loss_anchor'].item():.4f} "
                 f"ce={losses['loss_ce'].item():.4f} "
                 f"kl={losses['loss_kl'].item():.4f} "
+                f"wfm={weighted['fm']:.4f} "
+                f"wanc={weighted['anchor']:.4f} "
+                f"wce={weighted['ce']:.4f} "
+                f"wkl={weighted['kl']:.4f} "
+                f"lfm={cfg.lambda_fm:.3e} "
+                f"lanc={cfg.lambda_anchor:.3e} "
+                f"lce={cfg.lambda_ce:.3e} "
+                f"lkl={cfg.lambda_kl:.3e} "
                 f"t_mean={losses['t_mean'].item():.3f} "
                 f"k_mean={losses['k_mean'].item():.2f} "
                 f"it/s={it_s:.2f}"
@@ -529,6 +674,16 @@ def train_main(cfg: TrainConfig) -> None:
         if step % cfg.save_every == 0:
             save_checkpoint(cfg, step, student, optimizer, scaler)  # type: ignore[arg-type]
 
+        loss_balancer.update(
+            step,
+            {
+                "fm": float(losses["loss_fm"].item()),
+                "anchor": float(losses["loss_anchor"].item()),
+                "ce": float(losses["loss_ce"].item()),
+                "kl": float(losses["loss_kl"].item()),
+            },
+        )
+
         if step >= cfg.max_steps:
             break
 
@@ -538,13 +693,14 @@ def train_main(cfg: TrainConfig) -> None:
 
 if __name__ == "__main__":
     cfg = TrainConfig(
-        output_dir="./checkpoints_cfd",
+        output_dir="./checkpoints",
         run_name="cfd_poc",
-        max_steps=2000,
-        log_every=20,
-        save_every=200,
+        max_steps=100000,
+        log_every=100,
+        save_every=2000,
         amp=True,
         num_intervals=12,
+        last_interval_sample_prob=0.5,
         lambda_fm=1.0,
         lambda_anchor=1.0,
         lambda_ce=0.0,   # start with 0 for stability; enable later

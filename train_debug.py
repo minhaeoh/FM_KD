@@ -97,6 +97,11 @@ def _extract_student_state_dict(obj: Any) -> Dict[str, torch.Tensor]:
 
     if state and all(k.startswith("module.") for k in state.keys()):
         state = {k[len("module.") :]: v for k, v in state.items()}
+
+    if state:
+        student_state = {k[len("student.") :]: v for k, v in state.items() if k.startswith("student.")}
+        if student_state:
+            state = student_state
     return state
 
 

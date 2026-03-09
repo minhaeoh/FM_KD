@@ -18,9 +18,10 @@ class TrainConfig:
     # NOTE: this must match the number of anchor layers you saved (excluding embedding layer 0).
     num_intervals: int = 12
     num_samples_per_pair: int = 1  # R
+    last_interval_sample_prob: float = 0.5
 
     # Optimization
-    lr: float = 2e-4
+    lr: float = 2e-5
     weight_decay: float = 0.01
     betas: Tuple[float, float] = (0.9, 0.95)
     grad_clip: float = 1.0
@@ -30,8 +31,8 @@ class TrainConfig:
     device: str = "cuda"
     amp: bool = True
     grad_accum_steps: int = 1
-    max_steps: int = 20_000
-    log_every: int = 50
+    max_steps: int = 10000
+    log_every: int = 20
     save_every: int = 1000
 
     # Loss weights (POC: FM + Anchor only)
@@ -39,6 +40,13 @@ class TrainConfig:
     lambda_anchor: float = 1.0
     lambda_ce: float = 0.0
     lambda_kl: float = 0.0
+    auto_balance_losses: bool = True
+    balance_ema_decay: float = 0.95
+    balance_update_every: int = 20
+    balance_warmup_steps: int = 100
+    balance_loss_eps: float = 1e-8
+    balance_min_lambda: float = 1e-6
+    balance_max_lambda: float = 1e3
 
     # z0 init
     z0_noise_std: float = 1.0

@@ -27,7 +27,7 @@ OUTPUT_DIR = "/home/minhae/diffusion/FM_KD/data/collected_data"  # new output
 NUM_GPUS = 2
 BATCH_SIZE = 4
 SAVE_INTERVAL_SAMPLES = 100        # 100 samples per safetensors file
-TARGET_SAMPLE_COUNT = 50000
+TARGET_SAMPLE_COUNT = 10000
 RNG_SEED = 42
 
 # Optional: save teacher final-layer logits for Y tokens (distillation target).
