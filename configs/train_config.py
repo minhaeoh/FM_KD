@@ -31,9 +31,11 @@ class TrainConfig:
     device: str = "cuda"
     amp: bool = True
     grad_accum_steps: int = 1
-    max_steps: int = 10000
+    num_epochs: int = 5
+    max_steps: int = 0
     log_every: int = 20
     save_every: int = 1000
+    save_every_epochs: float = 0.5
 
     # Loss weights (POC: FM + Anchor only)
     lambda_fm: float = 1.0

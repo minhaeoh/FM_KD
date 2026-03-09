@@ -77,6 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=TrainConfig.max_steps)
     parser.add_argument("--log-every", type=int, default=TrainConfig.log_every)
     parser.add_argument("--save-every", type=int, default=TrainConfig.save_every)
+    parser.add_argument("--save-every-epochs", type=float, default=TrainConfig.save_every_epochs)
 
     parser.add_argument("--num-intervals", type=int, default=TrainConfig.num_intervals)
     parser.add_argument(
@@ -174,6 +175,7 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         max_steps=args.max_steps,
         log_every=args.log_every,
         save_every=args.save_every,
+        save_every_epochs=args.save_every_epochs,
         lambda_fm=args.lambda_fm,
         lambda_anchor=args.lambda_anchor,
         lambda_ce=args.lambda_ce,
@@ -416,6 +418,9 @@ def main() -> None:
 
     step = 0
     epoch = 0
+    steps_per_epoch = max(1, len(loader))
+    save_every_epochs = float(getattr(cfg, "save_every_epochs", 0.0))
+    next_save_at_epoch = save_every_epochs if save_every_epochs > 0.0 else None
     t_start = time.time()
     optimizer.zero_grad(set_to_none=True)
 
@@ -425,7 +430,7 @@ def main() -> None:
         sampler.set_epoch(epoch)
         epoch += 1
 
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader):
             step += 1
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_bf16_autocast):
                 losses = fsdp_model(batch)
@@ -541,7 +546,13 @@ def main() -> None:
 
             loss_balancer.update(step, raw_global)
 
-            if step % cfg.save_every == 0:
+            if next_save_at_epoch is not None:
+                epoch_progress = (epoch - 1) + float(batch_idx + 1) / float(steps_per_epoch)
+                if epoch_progress + 1e-12 >= next_save_at_epoch:
+                    save_fsdp_checkpoint(cfg, step, fsdp_model, optimizer, rank)
+                    while epoch_progress + 1e-12 >= next_save_at_epoch:
+                        next_save_at_epoch += save_every_epochs
+            elif step % cfg.save_every == 0:
                 save_fsdp_checkpoint(cfg, step, fsdp_model, optimizer, rank)
             if step >= cfg.max_steps:
                 break

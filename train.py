@@ -615,76 +615,90 @@ def train_main(cfg: TrainConfig) -> None:
     mask_init.train()
 
     step = 0
+    num_epochs = max(1, int(cfg.num_epochs))
+    steps_per_epoch = max(1, len(loader))
+    save_every_epochs = float(getattr(cfg, "save_every_epochs", 0.0))
+    next_save_at_epoch = save_every_epochs if save_every_epochs > 0.0 else None
     t_start = time.time()
 
     optimizer.zero_grad(set_to_none=True)
 
-    for batch in loader:
-        step += 1
+    for epoch in range(num_epochs):
+        for batch_idx, batch in enumerate(loader):
+            step += 1
 
-        with torch.cuda.amp.autocast(enabled=(cfg.amp and device.type == "cuda")):
-            losses = compute_losses(cfg, student, mask_init, batch)
-            loss = losses["loss_total"] / cfg.grad_accum_steps
+            with torch.cuda.amp.autocast(enabled=(cfg.amp and device.type == "cuda")):
+                losses = compute_losses(cfg, student, mask_init, batch)
+                loss = losses["loss_total"] / cfg.grad_accum_steps
 
-        scaler.scale(loss).backward()
+            scaler.scale(loss).backward()
 
-        # grad accumulation
-        if step % cfg.grad_accum_steps == 0:
-            if cfg.grad_clip > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
+            # grad accumulation
+            if step % cfg.grad_accum_steps == 0:
+                if cfg.grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
 
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
-        # logging
-        if step % cfg.log_every == 0:
-            elapsed = time.time() - t_start
-            it_s = step / max(elapsed, 1e-6)
-            raw = {
-                "fm": float(losses["loss_fm"].item()),
-                "anchor": float(losses["loss_anchor"].item()),
-                "ce": float(losses["loss_ce"].item()),
-                "kl": float(losses["loss_kl"].item()),
-            }
-            weighted = loss_balancer.weighted(raw)
-            msg = (
-                f"[step {step:>6}] "
-                f"loss={losses['loss_total'].item():.4f} "
-                f"fm={losses['loss_fm'].item():.4f} "
-                f"anc={losses['loss_anchor'].item():.4f} "
-                f"ce={losses['loss_ce'].item():.4f} "
-                f"kl={losses['loss_kl'].item():.4f} "
-                f"wfm={weighted['fm']:.4f} "
-                f"wanc={weighted['anchor']:.4f} "
-                f"wce={weighted['ce']:.4f} "
-                f"wkl={weighted['kl']:.4f} "
-                f"lfm={cfg.lambda_fm:.3e} "
-                f"lanc={cfg.lambda_anchor:.3e} "
-                f"lce={cfg.lambda_ce:.3e} "
-                f"lkl={cfg.lambda_kl:.3e} "
-                f"t_mean={losses['t_mean'].item():.3f} "
-                f"k_mean={losses['k_mean'].item():.2f} "
-                f"it/s={it_s:.2f}"
+            # logging
+            if step % cfg.log_every == 0:
+                elapsed = time.time() - t_start
+                it_s = step / max(elapsed, 1e-6)
+                raw = {
+                    "fm": float(losses["loss_fm"].item()),
+                    "anchor": float(losses["loss_anchor"].item()),
+                    "ce": float(losses["loss_ce"].item()),
+                    "kl": float(losses["loss_kl"].item()),
+                }
+                weighted = loss_balancer.weighted(raw)
+                msg = (
+                    f"[epoch {epoch + 1:>3}/{num_epochs:>3} step {step:>6}] "
+                    f"loss={losses['loss_total'].item():.4f} "
+                    f"fm={losses['loss_fm'].item():.4f} "
+                    f"anc={losses['loss_anchor'].item():.4f} "
+                    f"ce={losses['loss_ce'].item():.4f} "
+                    f"kl={losses['loss_kl'].item():.4f} "
+                    f"wfm={weighted['fm']:.4f} "
+                    f"wanc={weighted['anchor']:.4f} "
+                    f"wce={weighted['ce']:.4f} "
+                    f"wkl={weighted['kl']:.4f} "
+                    f"lfm={cfg.lambda_fm:.3e} "
+                    f"lanc={cfg.lambda_anchor:.3e} "
+                    f"lce={cfg.lambda_ce:.3e} "
+                    f"lkl={cfg.lambda_kl:.3e} "
+                    f"t_mean={losses['t_mean'].item():.3f} "
+                    f"k_mean={losses['k_mean'].item():.2f} "
+                    f"it/s={it_s:.2f}"
+                )
+                print(msg)
+
+            # save
+            if next_save_at_epoch is not None:
+                epoch_progress = epoch + float(batch_idx + 1) / float(steps_per_epoch)
+                if epoch_progress + 1e-12 >= next_save_at_epoch:
+                    save_checkpoint(cfg, step, student, optimizer, scaler)  # type: ignore[arg-type]
+                    while epoch_progress + 1e-12 >= next_save_at_epoch:
+                        next_save_at_epoch += save_every_epochs
+            elif step % cfg.save_every == 0:
+                save_checkpoint(cfg, step, student, optimizer, scaler)  # type: ignore[arg-type]
+
+            loss_balancer.update(
+                step,
+                {
+                    "fm": float(losses["loss_fm"].item()),
+                    "anchor": float(losses["loss_anchor"].item()),
+                    "ce": float(losses["loss_ce"].item()),
+                    "kl": float(losses["loss_kl"].item()),
+                },
             )
-            print(msg)
 
-        # save
-        if step % cfg.save_every == 0:
-            save_checkpoint(cfg, step, student, optimizer, scaler)  # type: ignore[arg-type]
+            if cfg.max_steps > 0 and step >= cfg.max_steps:
+                break
 
-        loss_balancer.update(
-            step,
-            {
-                "fm": float(losses["loss_fm"].item()),
-                "anchor": float(losses["loss_anchor"].item()),
-                "ce": float(losses["loss_ce"].item()),
-                "kl": float(losses["loss_kl"].item()),
-            },
-        )
-
-        if step >= cfg.max_steps:
+        if cfg.max_steps > 0 and step >= cfg.max_steps:
             break
 
     # final save
@@ -695,6 +709,7 @@ if __name__ == "__main__":
     cfg = TrainConfig(
         output_dir="./checkpoints",
         run_name="cfd_poc",
+        num_epochs=10,
         max_steps=100000,
         log_every=100,
         save_every=2000,
